@@ -193,10 +193,10 @@ async fn benchmark_merge_tpcds(
     merge: fn(DataFrame, DeltaTable) -> Result<MergeBuilder, DeltaTableError>,
 ) -> Result<(core::time::Duration, MergeMetrics), DataFusionError> {
     let table = DeltaTableBuilder::from_uri(path).load().await?;
-    let file_count = table.state.files().len();
+    let file_count = table.snapshot()?.files_count();
 
     let provider = DeltaTableProvider::try_new(
-        table.state.clone(),
+        table.snapshot()?.clone(),
         table.log_store(),
         DeltaScanConfig {
             file_column_name: Some("file_path".to_string()),
@@ -214,7 +214,7 @@ async fn benchmark_merge_tpcds(
         .filter(col("r").lt_eq(lit(parameters.sample_files)))?;
 
     let file_sample = files.collect_partitioned().await?;
-    let schema = file_sample.get(0).unwrap().get(0).unwrap().schema();
+    let schema = file_sample.first().unwrap().first().unwrap().schema();
     let mem_table = Arc::new(MemTable::try_new(schema, file_sample)?);
     ctx.register_table("file_sample", mem_table)?;
     let file_sample_count = ctx.table("file_sample").await?.count().await?;
@@ -265,6 +265,14 @@ async fn benchmark_merge_tpcds(
         .object_store()
         .delete(&Path::parse("_delta_log/00000000000000000002.json")?)
         .await?;
+    table
+        .object_store()
+        .delete(&Path::parse("_delta_log/00000000000000000003.json")?)
+        .await?;
+    let _ = table
+        .object_store()
+        .delete(&Path::parse("_delta_log/00000000000000000004.json")?)
+        .await;
 
     Ok((duration, metrics))
 }
@@ -355,6 +363,7 @@ struct MergePrefArgs {
 
 #[tokio::main]
 async fn main() {
+    type MergeOp = fn(DataFrame, DeltaTable) -> Result<MergeBuilder, DeltaTableError>;
     match MergePrefArgs::parse().command {
         Command::Convert(Convert {
             tpcds_path,
@@ -364,11 +373,9 @@ async fn main() {
                 .await
                 .unwrap();
         }
+
         Command::Bench(BenchArg { table_path, name }) => {
-            let (merge_op, params): (
-                fn(DataFrame, DeltaTable) -> Result<MergeBuilder, DeltaTableError>,
-                MergePerfParams,
-            ) = match name {
+            let (merge_op, params): (MergeOp, MergePerfParams) = match name {
                 MergeBench::Upsert(params) => (merge_upsert, params),
                 MergeBench::Delete(params) => (merge_delete, params),
                 MergeBench::Insert(params) => (merge_insert, params),

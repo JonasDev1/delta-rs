@@ -31,6 +31,8 @@ if sys.version_info >= (3, 8):
 else:
     from typing_extensions import Literal
 
+import warnings
+
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pa_fs
@@ -48,7 +50,13 @@ from .schema import (
     convert_pyarrow_recordbatchreader,
     convert_pyarrow_table,
 )
-from .table import MAX_SUPPORTED_WRITER_VERSION, DeltaTable
+from .table import (
+    MAX_SUPPORTED_PYARROW_WRITER_VERSION,
+    NOT_SUPPORTED_PYARROW_WRITER_VERSIONS,
+    SUPPORTED_WRITER_FEATURES,
+    DeltaTable,
+    WriterProperties,
+)
 
 try:
     import pandas as pd  # noqa: F811
@@ -84,7 +92,6 @@ def write_deltalake(
     *,
     schema: Optional[Union[pa.Schema, DeltaSchema]] = ...,
     partition_by: Optional[Union[List[str], str]] = ...,
-    filesystem: Optional[pa_fs.FileSystem] = None,
     mode: Literal["error", "append", "overwrite", "ignore"] = ...,
     file_options: Optional[ds.ParquetFileWriteOptions] = ...,
     max_partitions: Optional[int] = ...,
@@ -96,12 +103,13 @@ def write_deltalake(
     description: Optional[str] = ...,
     configuration: Optional[Mapping[str, Optional[str]]] = ...,
     overwrite_schema: bool = ...,
+    schema_mode: Optional[Literal["overwrite"]] = ...,
     storage_options: Optional[Dict[str, str]] = ...,
     partition_filters: Optional[List[Tuple[str, str, Any]]] = ...,
     large_dtypes: bool = ...,
     engine: Literal["pyarrow"] = ...,
-) -> None:
-    ...
+    custom_metadata: Optional[Dict[str, str]] = ...,
+) -> None: ...
 
 
 @overload
@@ -118,18 +126,47 @@ def write_deltalake(
     *,
     schema: Optional[Union[pa.Schema, DeltaSchema]] = ...,
     partition_by: Optional[Union[List[str], str]] = ...,
-    mode: Literal["error", "append", "overwrite", "ignore"] = ...,
-    max_rows_per_group: int = ...,
+    mode: Literal["error", "append", "ignore"] = ...,
     name: Optional[str] = ...,
     description: Optional[str] = ...,
     configuration: Optional[Mapping[str, Optional[str]]] = ...,
     overwrite_schema: bool = ...,
+    schema_mode: Optional[Literal["merge", "overwrite"]] = ...,
+    storage_options: Optional[Dict[str, str]] = ...,
+    large_dtypes: bool = ...,
+    engine: Literal["rust"],
+    writer_properties: WriterProperties = ...,
+    custom_metadata: Optional[Dict[str, str]] = ...,
+) -> None: ...
+
+
+@overload
+def write_deltalake(
+    table_or_uri: Union[str, Path, DeltaTable],
+    data: Union[
+        "pd.DataFrame",
+        ds.Dataset,
+        pa.Table,
+        pa.RecordBatch,
+        Iterable[pa.RecordBatch],
+        RecordBatchReader,
+    ],
+    *,
+    schema: Optional[Union[pa.Schema, DeltaSchema]] = ...,
+    partition_by: Optional[Union[List[str], str]] = ...,
+    mode: Literal["overwrite"],
+    name: Optional[str] = ...,
+    description: Optional[str] = ...,
+    configuration: Optional[Mapping[str, Optional[str]]] = ...,
+    overwrite_schema: bool = ...,
+    schema_mode: Optional[Literal["merge", "overwrite"]] = ...,
     storage_options: Optional[Dict[str, str]] = ...,
     predicate: Optional[str] = ...,
     large_dtypes: bool = ...,
     engine: Literal["rust"],
-) -> None:
-    ...
+    writer_properties: WriterProperties = ...,
+    custom_metadata: Optional[Dict[str, str]] = ...,
+) -> None: ...
 
 
 def write_deltalake(
@@ -145,7 +182,6 @@ def write_deltalake(
     *,
     schema: Optional[Union[pa.Schema, DeltaSchema]] = None,
     partition_by: Optional[Union[List[str], str]] = None,
-    filesystem: Optional[pa_fs.FileSystem] = None,
     mode: Literal["error", "append", "overwrite", "ignore"] = "error",
     file_options: Optional[ds.ParquetFileWriteOptions] = None,
     max_partitions: Optional[int] = None,
@@ -157,39 +193,26 @@ def write_deltalake(
     description: Optional[str] = None,
     configuration: Optional[Mapping[str, Optional[str]]] = None,
     overwrite_schema: bool = False,
+    schema_mode: Optional[Literal["merge", "overwrite"]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     partition_filters: Optional[List[Tuple[str, str, Any]]] = None,
     predicate: Optional[str] = None,
     large_dtypes: bool = False,
     engine: Literal["pyarrow", "rust"] = "pyarrow",
+    writer_properties: Optional[WriterProperties] = None,
+    custom_metadata: Optional[Dict[str, str]] = None,
 ) -> None:
     """Write to a Delta Lake table
 
     If the table does not already exist, it will be created.
 
-    This function only supports writer protocol version 2 currently. When
-    attempting to write to an existing table with a higher min_writer_version,
-    this function will throw DeltaProtocolError.
-
-    Note that this function does NOT register this table in a data catalog.
+    The pyarrow writer supports protocol version 2 currently and won't be updated.
+    For higher protocol support use engine='rust', this will become the default
+    eventually.
 
     A locking mechanism is needed to prevent unsafe concurrent writes to a
-    delta lake directory when writing to S3. DynamoDB is the only available
-    locking provider at the moment in delta-rs. To enable DynamoDB as the
-    locking provider, you need to set the `AWS_S3_LOCKING_PROVIDER` to 'dynamodb'
-    as a storage_option or as an environment variable.
-
-    Additionally, you must create a DynamoDB table with the name 'delta_rs_lock_table'
-    so that it can be automatically discovered by delta-rs. Alternatively, you can
-    use a table name of your choice, but you must set the `DYNAMO_LOCK_TABLE_NAME`
-    variable to match your chosen table name. The required schema for the DynamoDB
-    table is as follows:
-
-    - Key Schema: AttributeName=key, KeyType=HASH
-    - Attribute Definitions: AttributeName=key, AttributeType=S
-
-    Please note that this locking mechanism is not compatible with any other
-    locking mechanisms, including the one used by Spark.
+    delta lake directory when writing to S3. For more information on the setup, follow
+    this usage guide: https://delta-io.github.io/delta-rs/usage/writing/writing-to-s3-with-locking-provider/
 
     Args:
         table_or_uri: URI of a table or a DeltaTable object.
@@ -197,9 +220,6 @@ def write_deltalake(
         schema: Optional schema to write.
         partition_by: List of columns to partition the table by. Only required
             when creating a new table.
-        filesystem: Optional filesystem to pass to PyArrow. If not provided will
-            be inferred from uri. The file system has to be rooted in the table root.
-            Use the pyarrow.fs.SubTreeFileSystem, to adopt the root of pyarrow file systems.
         mode: How to handle existing data. Default is to error if table already exists.
             If 'append', will add new data.
             If 'overwrite', will replace table with new data.
@@ -227,13 +247,16 @@ def write_deltalake(
         name: User-provided identifier for this table.
         description: User-provided description for this table.
         configuration: A map containing configuration options for the metadata action.
-        overwrite_schema: If True, allows updating the schema of the table.
-        storage_options: options passed to the native delta filesystem. Unused if 'filesystem' is defined.
+        overwrite_schema: Deprecated, use schema_mode instead.
+        schema_mode: If set to "overwrite", allows replacing the schema of the table. Set to "merge" to merge with existing schema.
+        storage_options: options passed to the native delta filesystem.
         predicate: When using `Overwrite` mode, replace data that matches a predicate. Only used in rust engine.
         partition_filters: the partition filters that will be used for partition overwrite. Only used in pyarrow engine.
         large_dtypes: If True, the data schema is kept in large_dtypes, has no effect on pandas dataframe input.
         engine: writer engine to write the delta table. `Rust` engine is still experimental but you may
             see up to 4x performance improvements over pyarrow.
+        writer_properties: Pass writer properties to the Rust parquet writer.
+        custom_metadata: Custom metadata to add to the commitInfo.
     """
     table, table_uri = try_get_table_and_table_uri(table_or_uri, storage_options)
     if table is not None:
@@ -243,12 +266,19 @@ def write_deltalake(
         table.update_incremental()
 
     __enforce_append_only(table=table, configuration=configuration, mode=mode)
+    if overwrite_schema:
+        schema_mode = "overwrite"
 
+        warnings.warn(
+            "overwrite_schema is deprecated, use schema_mode instead. ",
+            category=DeprecationWarning,
+            stacklevel=2,
+        )
     if isinstance(partition_by, str):
         partition_by = [partition_by]
 
     if isinstance(schema, DeltaSchema):
-        schema = schema.to_pyarrow()
+        schema = schema.to_pyarrow(as_large_types=True)
 
     if isinstance(data, RecordBatchReader):
         data = convert_pyarrow_recordbatchreader(data, large_dtypes)
@@ -289,42 +319,53 @@ def write_deltalake(
             partition_by=partition_by,
             mode=mode,
             max_rows_per_group=max_rows_per_group,
-            overwrite_schema=overwrite_schema,
+            schema_mode=schema_mode,
             predicate=predicate,
             name=name,
             description=description,
             configuration=configuration,
             storage_options=storage_options,
+            writer_properties=(
+                writer_properties._to_dict() if writer_properties else None
+            ),
+            custom_metadata=custom_metadata,
         )
         if table:
             table.update_incremental()
 
     elif engine == "pyarrow":
-        # We need to write against the latest table version
-        if filesystem is not None:
-            raise NotImplementedError(
-                "Filesystem support is not yet implemented.  #570"
+        if schema_mode == "merge":
+            raise ValueError(
+                "schema_mode 'merge' is not supported in pyarrow engine. Use engine=rust"
             )
-
+        # We need to write against the latest table version
         filesystem = pa_fs.PyFileSystem(DeltaStorageHandler(table_uri, storage_options))
 
+        def sort_arrow_schema(schema: pa.schema) -> pa.schema:
+            sorted_cols = sorted(iter(schema), key=lambda x: (x.name, str(x.type)))
+            return pa.schema(sorted_cols)
+
         if table:  # already exists
-            if schema != table.schema().to_pyarrow(
-                as_large_types=large_dtypes
-            ) and not (mode == "overwrite" and overwrite_schema):
+            if sort_arrow_schema(schema) != sort_arrow_schema(
+                table.schema().to_pyarrow(as_large_types=large_dtypes)
+            ) and not (mode == "overwrite" and schema_mode == "overwrite"):
                 raise ValueError(
                     "Schema of data does not match table schema\n"
                     f"Data schema:\n{schema}\nTable Schema:\n{table.schema().to_pyarrow(as_large_types=large_dtypes)}"
                 )
             if mode == "error":
-                raise AssertionError("DeltaTable already exists.")
+                raise FileExistsError(
+                    "Delta table already exists, write mode set to error."
+                )
             elif mode == "ignore":
                 return
 
             current_version = table.version()
 
-            if partition_by:
-                assert partition_by == table.metadata().partition_columns
+            if partition_by and partition_by != table.metadata().partition_columns:
+                raise ValueError(
+                    f"Partition columns should be {table.metadata().partition_columns} but is {partition_by}"
+                )
             else:
                 partition_by = table.metadata().partition_columns
 
@@ -388,12 +429,29 @@ def write_deltalake(
         if table is not None:
             # We don't currently provide a way to set invariants
             # (and maybe never will), so only enforce if already exist.
-            if table.protocol().min_writer_version > MAX_SUPPORTED_WRITER_VERSION:
+            table_protocol = table.protocol()
+            if (
+                table_protocol.min_writer_version > MAX_SUPPORTED_PYARROW_WRITER_VERSION
+                or table_protocol.min_writer_version
+                in NOT_SUPPORTED_PYARROW_WRITER_VERSIONS
+            ):
                 raise DeltaProtocolError(
                     "This table's min_writer_version is "
-                    f"{table.protocol().min_writer_version}, "
-                    "but this method only supports version 2."
+                    f"{table_protocol.min_writer_version}, "
+                    f"""but this method only supports version 2 or 7 with at max these features {SUPPORTED_WRITER_FEATURES} enabled. 
+                    Try engine='rust' instead which supports more features and writer versions."""
                 )
+            if (
+                table_protocol.min_writer_version >= 7
+                and table_protocol.writer_features is not None
+            ):
+                missing_features = {*table_protocol.writer_features}.difference(
+                    SUPPORTED_WRITER_FEATURES
+                )
+                if len(missing_features) > 0:
+                    raise DeltaProtocolError(
+                        f"The table has set these writer features: {missing_features} but these are not supported by the pyarrow writer. Please use engine='rust'."
+                    )
 
             invariants = table.schema().invariants
             checker = _DeltaDataChecker(invariants)
@@ -403,12 +461,12 @@ def write_deltalake(
             ) -> None:
                 if table is None:
                     return
-                existed_partitions: FrozenSet[
-                    FrozenSet[Tuple[str, Optional[str]]]
-                ] = table._table.get_active_partitions()
-                allowed_partitions: FrozenSet[
-                    FrozenSet[Tuple[str, Optional[str]]]
-                ] = table._table.get_active_partitions(partition_filters)
+                existed_partitions: FrozenSet[FrozenSet[Tuple[str, Optional[str]]]] = (
+                    table._table.get_active_partitions()
+                )
+                allowed_partitions: FrozenSet[FrozenSet[Tuple[str, Optional[str]]]] = (
+                    table._table.get_active_partitions(partition_filters)
+                )
                 partition_values = pa.RecordBatch.from_arrays(
                     [
                         batch.column(column_name)
@@ -487,6 +545,7 @@ def write_deltalake(
                 description,
                 configuration,
                 storage_options,
+                custom_metadata,
             )
         else:
             table._table.create_write_transaction(
@@ -495,6 +554,7 @@ def write_deltalake(
                 partition_by or [],
                 schema,
                 partition_filters,
+                custom_metadata,
             )
             table.update_incremental()
     else:
@@ -652,7 +712,8 @@ def get_file_stats_from_metadata(
 
     def iter_groups(metadata: Any) -> Iterator[Any]:
         for i in range(metadata.num_row_groups):
-            yield metadata.row_group(i)
+            if metadata.row_group(i).num_rows > 0:
+                yield metadata.row_group(i)
 
     for column_idx in range(metadata.num_columns):
         name = metadata.row_group(0).column(column_idx).path_in_schema

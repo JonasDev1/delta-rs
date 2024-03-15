@@ -13,7 +13,6 @@ use std::time;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::pyarrow::PyArrowType;
-use arrow_schema::DataType;
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use deltalake::arrow::compute::concat_batches;
 use deltalake::arrow::ffi_stream::ArrowArrayStreamReader;
@@ -26,24 +25,28 @@ use deltalake::datafusion::datasource::provider::TableProvider;
 use deltalake::datafusion::prelude::SessionContext;
 use deltalake::delta_datafusion::DeltaDataChecker;
 use deltalake::errors::DeltaTableError;
-use deltalake::kernel::{Action, Add, Invariant, Remove, StructType};
+use deltalake::kernel::{Action, Add, Invariant, LogicalFile, Remove, Scalar, StructType};
+use deltalake::operations::constraints::ConstraintBuilder;
 use deltalake::operations::convert_to_delta::{ConvertToDeltaBuilder, PartitionStrategy};
 use deltalake::operations::delete::DeleteBuilder;
+use deltalake::operations::drop_constraints::DropConstraintBuilder;
 use deltalake::operations::filesystem_check::FileSystemCheckBuilder;
 use deltalake::operations::merge::MergeBuilder;
 use deltalake::operations::optimize::{OptimizeBuilder, OptimizeType};
 use deltalake::operations::restore::RestoreBuilder;
-use deltalake::operations::transaction::commit;
+use deltalake::operations::transaction::{CommitBuilder, CommitProperties};
 use deltalake::operations::update::UpdateBuilder;
 use deltalake::operations::vacuum::VacuumBuilder;
+use deltalake::parquet::basic::Compression;
+use deltalake::parquet::errors::ParquetError;
 use deltalake::parquet::file::properties::WriterProperties;
 use deltalake::partitions::PartitionFilter;
-use deltalake::protocol::{ColumnCountStat, ColumnValueStat, DeltaOperation, SaveMode, Stats};
-use deltalake::DeltaOps;
+use deltalake::protocol::{DeltaOperation, SaveMode};
 use deltalake::DeltaTableBuilder;
+use deltalake::{DeltaOps, DeltaResult};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyFrozenSet;
+use pyo3::types::{PyDict, PyFrozenSet};
 use serde_json::{Map, Value};
 
 use crate::error::DeltaProtocolError;
@@ -84,6 +87,8 @@ struct RawDeltaTableMetaData {
     #[pyo3(get)]
     configuration: HashMap<String, Option<String>>,
 }
+
+type StringVec = Vec<String>;
 
 #[pymethods]
 impl RawDeltaTable {
@@ -143,10 +148,35 @@ impl RawDeltaTable {
         })
     }
 
-    pub fn protocol_versions(&self) -> PyResult<(i32, i32)> {
+    pub fn protocol_versions(&self) -> PyResult<(i32, i32, Option<StringVec>, Option<StringVec>)> {
+        let table_protocol = self._table.protocol().map_err(PythonError::from)?;
         Ok((
-            self._table.protocol().min_reader_version,
-            self._table.protocol().min_writer_version,
+            table_protocol.min_reader_version,
+            table_protocol.min_writer_version,
+            table_protocol
+                .writer_features
+                .as_ref()
+                .and_then(|features| {
+                    let empty_set = !features.is_empty();
+                    empty_set.then(|| {
+                        features
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<String>>()
+                    })
+                }),
+            table_protocol
+                .reader_features
+                .as_ref()
+                .and_then(|features| {
+                    let empty_set = !features.is_empty();
+                    empty_set.then(|| {
+                        features
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<String>>()
+                    })
+                }),
         ))
     }
 
@@ -216,6 +246,7 @@ impl RawDeltaTable {
             Ok(self
                 ._table
                 .get_files_iter()
+                .map_err(PythonError::from)?
                 .map(|f| f.to_string())
                 .collect())
         }
@@ -232,7 +263,11 @@ impl RawDeltaTable {
                 .get_file_uris_by_partitions(&filters)
                 .map_err(PythonError::from)?)
         } else {
-            Ok(self._table.get_file_uris().collect())
+            Ok(self
+                ._table
+                .get_file_uris()
+                .map_err(PythonError::from)?
+                .collect())
         }
     }
 
@@ -244,19 +279,31 @@ impl RawDeltaTable {
 
     /// Run the Vacuum command on the Delta Table: list and delete files no longer referenced
     /// by the Delta table and are older than the retention threshold.
-    #[pyo3(signature = (dry_run, retention_hours = None, enforce_retention_duration = true))]
+    #[pyo3(signature = (dry_run, retention_hours = None, enforce_retention_duration = true, custom_metadata=None))]
     pub fn vacuum(
         &mut self,
         dry_run: bool,
         retention_hours: Option<u64>,
         enforce_retention_duration: bool,
+        custom_metadata: Option<HashMap<String, String>>,
     ) -> PyResult<Vec<String>> {
-        let mut cmd = VacuumBuilder::new(self._table.log_store(), self._table.state.clone())
-            .with_enforce_retention_duration(enforce_retention_duration)
-            .with_dry_run(dry_run);
+        let mut cmd = VacuumBuilder::new(
+            self._table.log_store(),
+            self._table.snapshot().map_err(PythonError::from)?.clone(),
+        )
+        .with_enforce_retention_duration(enforce_retention_duration)
+        .with_dry_run(dry_run);
         if let Some(retention_period) = retention_hours {
             cmd = cmd.with_retention_period(Duration::hours(retention_period as i64));
         }
+
+        if let Some(metadata) = custom_metadata {
+            let json_metadata: Map<String, Value> =
+                metadata.into_iter().map(|(k, v)| (k, v.into())).collect();
+            cmd = cmd
+                .with_commit_properties(CommitProperties::default().with_metadata(json_metadata));
+        };
+
         let (table, metrics) = rt()?
             .block_on(cmd.into_future())
             .map_err(PythonError::from)?;
@@ -265,41 +312,25 @@ impl RawDeltaTable {
     }
 
     /// Run the UPDATE command on the Delta Table
-    #[pyo3(signature = (updates, predicate=None, writer_properties=None, safe_cast = false))]
+    #[pyo3(signature = (updates, predicate=None, writer_properties=None, safe_cast = false, custom_metadata = None))]
     pub fn update(
         &mut self,
         updates: HashMap<String, String>,
         predicate: Option<String>,
-        writer_properties: Option<HashMap<String, usize>>,
+        writer_properties: Option<HashMap<String, Option<String>>>,
         safe_cast: bool,
+        custom_metadata: Option<HashMap<String, String>>,
     ) -> PyResult<String> {
-        let mut cmd = UpdateBuilder::new(self._table.log_store(), self._table.state.clone())
-            .with_safe_cast(safe_cast);
+        let mut cmd = UpdateBuilder::new(
+            self._table.log_store(),
+            self._table.snapshot().map_err(PythonError::from)?.clone(),
+        )
+        .with_safe_cast(safe_cast);
 
         if let Some(writer_props) = writer_properties {
-            let mut properties = WriterProperties::builder();
-            let data_page_size_limit = writer_props.get("data_page_size_limit");
-            let dictionary_page_size_limit = writer_props.get("dictionary_page_size_limit");
-            let data_page_row_count_limit = writer_props.get("data_page_row_count_limit");
-            let write_batch_size = writer_props.get("write_batch_size");
-            let max_row_group_size = writer_props.get("max_row_group_size");
-
-            if let Some(data_page_size) = data_page_size_limit {
-                properties = properties.set_data_page_size_limit(*data_page_size);
-            }
-            if let Some(dictionary_page_size) = dictionary_page_size_limit {
-                properties = properties.set_dictionary_page_size_limit(*dictionary_page_size);
-            }
-            if let Some(data_page_row_count) = data_page_row_count_limit {
-                properties = properties.set_data_page_row_count_limit(*data_page_row_count);
-            }
-            if let Some(batch_size) = write_batch_size {
-                properties = properties.set_write_batch_size(*batch_size);
-            }
-            if let Some(row_group_size) = max_row_group_size {
-                properties = properties.set_max_row_group_size(*row_group_size);
-            }
-            cmd = cmd.with_writer_properties(properties.build());
+            cmd = cmd.with_writer_properties(
+                set_writer_properties(writer_props).map_err(PythonError::from)?,
+            );
         }
 
         for (col_name, expression) in updates {
@@ -310,6 +341,13 @@ impl RawDeltaTable {
             cmd = cmd.with_predicate(update_predicate);
         }
 
+        if let Some(metadata) = custom_metadata {
+            let json_metadata: Map<String, Value> =
+                metadata.into_iter().map(|(k, v)| (k, v.into())).collect();
+            cmd = cmd
+                .with_commit_properties(CommitProperties::default().with_metadata(json_metadata));
+        };
+
         let (table, metrics) = rt()?
             .block_on(cmd.into_future())
             .map_err(PythonError::from)?;
@@ -318,22 +356,48 @@ impl RawDeltaTable {
     }
 
     /// Run the optimize command on the Delta Table: merge small files into a large file by bin-packing.
-    #[pyo3(signature = (partition_filters = None, target_size = None, max_concurrent_tasks = None, min_commit_interval = None))]
+    #[pyo3(signature = (
+        partition_filters = None,
+        target_size = None,
+        max_concurrent_tasks = None,
+        min_commit_interval = None,
+        writer_properties=None,
+        custom_metadata=None,
+    ))]
     pub fn compact_optimize(
         &mut self,
         partition_filters: Option<Vec<(&str, &str, PartitionFilterValue)>>,
         target_size: Option<i64>,
         max_concurrent_tasks: Option<usize>,
         min_commit_interval: Option<u64>,
+        writer_properties: Option<HashMap<String, Option<String>>>,
+        custom_metadata: Option<HashMap<String, String>>,
     ) -> PyResult<String> {
-        let mut cmd = OptimizeBuilder::new(self._table.log_store(), self._table.state.clone())
-            .with_max_concurrent_tasks(max_concurrent_tasks.unwrap_or_else(num_cpus::get));
+        let mut cmd = OptimizeBuilder::new(
+            self._table.log_store(),
+            self._table.snapshot().map_err(PythonError::from)?.clone(),
+        )
+        .with_max_concurrent_tasks(max_concurrent_tasks.unwrap_or_else(num_cpus::get));
         if let Some(size) = target_size {
             cmd = cmd.with_target_size(size);
         }
         if let Some(commit_interval) = min_commit_interval {
             cmd = cmd.with_min_commit_interval(time::Duration::from_secs(commit_interval));
         }
+
+        if let Some(writer_props) = writer_properties {
+            cmd = cmd.with_writer_properties(
+                set_writer_properties(writer_props).map_err(PythonError::from)?,
+            );
+        }
+
+        if let Some(metadata) = custom_metadata {
+            let json_metadata: Map<String, Value> =
+                metadata.into_iter().map(|(k, v)| (k, v.into())).collect();
+            cmd = cmd
+                .with_commit_properties(CommitProperties::default().with_metadata(json_metadata));
+        };
+
         let converted_filters = convert_partition_filters(partition_filters.unwrap_or_default())
             .map_err(PythonError::from)?;
         cmd = cmd.with_filters(&converted_filters);
@@ -346,7 +410,15 @@ impl RawDeltaTable {
     }
 
     /// Run z-order variation of optimize
-    #[pyo3(signature = (z_order_columns, partition_filters = None, target_size = None, max_concurrent_tasks = None, max_spill_size = 20 * 1024 * 1024 * 1024, min_commit_interval = None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (z_order_columns,
+        partition_filters = None,
+        target_size = None,
+        max_concurrent_tasks = None,
+        max_spill_size = 20 * 1024 * 1024 * 1024,
+        min_commit_interval = None,
+        writer_properties=None,
+        custom_metadata=None,))]
     pub fn z_order_optimize(
         &mut self,
         z_order_columns: Vec<String>,
@@ -355,17 +427,35 @@ impl RawDeltaTable {
         max_concurrent_tasks: Option<usize>,
         max_spill_size: usize,
         min_commit_interval: Option<u64>,
+        writer_properties: Option<HashMap<String, Option<String>>>,
+        custom_metadata: Option<HashMap<String, String>>,
     ) -> PyResult<String> {
-        let mut cmd = OptimizeBuilder::new(self._table.log_store(), self._table.state.clone())
-            .with_max_concurrent_tasks(max_concurrent_tasks.unwrap_or_else(num_cpus::get))
-            .with_max_spill_size(max_spill_size)
-            .with_type(OptimizeType::ZOrder(z_order_columns));
+        let mut cmd = OptimizeBuilder::new(
+            self._table.log_store(),
+            self._table.snapshot().map_err(PythonError::from)?.clone(),
+        )
+        .with_max_concurrent_tasks(max_concurrent_tasks.unwrap_or_else(num_cpus::get))
+        .with_max_spill_size(max_spill_size)
+        .with_type(OptimizeType::ZOrder(z_order_columns));
         if let Some(size) = target_size {
             cmd = cmd.with_target_size(size);
         }
         if let Some(commit_interval) = min_commit_interval {
             cmd = cmd.with_min_commit_interval(time::Duration::from_secs(commit_interval));
         }
+
+        if let Some(writer_props) = writer_properties {
+            cmd = cmd.with_writer_properties(
+                set_writer_properties(writer_props).map_err(PythonError::from)?,
+            );
+        }
+
+        if let Some(metadata) = custom_metadata {
+            let json_metadata: Map<String, Value> =
+                metadata.into_iter().map(|(k, v)| (k, v.into())).collect();
+            cmd = cmd
+                .with_commit_properties(CommitProperties::default().with_metadata(json_metadata));
+        };
 
         let converted_filters = convert_partition_filters(partition_filters.unwrap_or_default())
             .map_err(PythonError::from)?;
@@ -378,6 +468,63 @@ impl RawDeltaTable {
         Ok(serde_json::to_string(&metrics).unwrap())
     }
 
+    #[pyo3(signature = (constraints, custom_metadata=None))]
+    pub fn add_constraints(
+        &mut self,
+        constraints: HashMap<String, String>,
+        custom_metadata: Option<HashMap<String, String>>,
+    ) -> PyResult<()> {
+        let mut cmd = ConstraintBuilder::new(
+            self._table.log_store(),
+            self._table.snapshot().map_err(PythonError::from)?.clone(),
+        );
+
+        for (col_name, expression) in constraints {
+            cmd = cmd.with_constraint(col_name.clone(), expression.clone());
+        }
+
+        if let Some(metadata) = custom_metadata {
+            let json_metadata: Map<String, Value> =
+                metadata.into_iter().map(|(k, v)| (k, v.into())).collect();
+            cmd = cmd
+                .with_commit_properties(CommitProperties::default().with_metadata(json_metadata));
+        };
+
+        let table = rt()?
+            .block_on(cmd.into_future())
+            .map_err(PythonError::from)?;
+        self._table.state = table.state;
+        Ok(())
+    }
+
+    #[pyo3(signature = (name, raise_if_not_exists, custom_metadata=None))]
+    pub fn drop_constraints(
+        &mut self,
+        name: String,
+        raise_if_not_exists: bool,
+        custom_metadata: Option<HashMap<String, String>>,
+    ) -> PyResult<()> {
+        let mut cmd = DropConstraintBuilder::new(
+            self._table.log_store(),
+            self._table.snapshot().map_err(PythonError::from)?.clone(),
+        )
+        .with_constraint(name)
+        .with_raise_if_not_exists(raise_if_not_exists);
+
+        if let Some(metadata) = custom_metadata {
+            let json_metadata: Map<String, Value> =
+                metadata.into_iter().map(|(k, v)| (k, v.into())).collect();
+            cmd = cmd
+                .with_commit_properties(CommitProperties::default().with_metadata(json_metadata));
+        };
+
+        let table = rt()?
+            .block_on(cmd.into_future())
+            .map_err(PythonError::from)?;
+        self._table.state = table.state;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (source,
         predicate,
@@ -385,6 +532,7 @@ impl RawDeltaTable {
         target_alias = None,
         safe_cast = false,
         writer_properties = None,
+        custom_metadata = None,
         matched_update_updates = None,
         matched_update_predicate = None,
         matched_delete_predicate = None,
@@ -398,12 +546,14 @@ impl RawDeltaTable {
     ))]
     pub fn merge_execute(
         &mut self,
+        py: Python,
         source: PyArrowType<ArrowArrayStreamReader>,
         predicate: String,
         source_alias: Option<String>,
         target_alias: Option<String>,
         safe_cast: bool,
-        writer_properties: Option<HashMap<String, usize>>,
+        writer_properties: Option<HashMap<String, Option<String>>>,
+        custom_metadata: Option<HashMap<String, String>>,
         matched_update_updates: Option<Vec<HashMap<String, String>>>,
         matched_update_predicate: Option<Vec<Option<String>>>,
         matched_delete_predicate: Option<Vec<String>>,
@@ -415,177 +565,175 @@ impl RawDeltaTable {
         not_matched_by_source_delete_predicate: Option<Vec<String>>,
         not_matched_by_source_delete_all: Option<bool>,
     ) -> PyResult<String> {
-        let ctx = SessionContext::new();
-        let schema = source.0.schema();
-        let batches = vec![source.0.map(|batch| batch.unwrap()).collect::<Vec<_>>()];
-        let table_provider: Arc<dyn TableProvider> =
-            Arc::new(MemTable::try_new(schema, batches).unwrap());
-        let source_df = ctx.read_table(table_provider).unwrap();
+        py.allow_threads(|| {
+            let ctx = SessionContext::new();
+            let schema = source.0.schema();
+            let batches = vec![source.0.map(|batch| batch.unwrap()).collect::<Vec<_>>()];
+            let table_provider: Arc<dyn TableProvider> =
+                Arc::new(MemTable::try_new(schema, batches).unwrap());
+            let source_df = ctx.read_table(table_provider).unwrap();
 
-        let mut cmd = MergeBuilder::new(
-            self._table.log_store(),
-            self._table.state.clone(),
-            predicate,
-            source_df,
-        )
-        .with_safe_cast(safe_cast);
+            let mut cmd = MergeBuilder::new(
+                self._table.log_store(),
+                self._table.snapshot().map_err(PythonError::from)?.clone(),
+                predicate,
+                source_df,
+            )
+            .with_safe_cast(safe_cast);
 
-        if let Some(src_alias) = source_alias {
-            cmd = cmd.with_source_alias(src_alias);
-        }
-
-        if let Some(trgt_alias) = target_alias {
-            cmd = cmd.with_target_alias(trgt_alias);
-        }
-
-        if let Some(writer_props) = writer_properties {
-            let mut properties = WriterProperties::builder();
-            let data_page_size_limit = writer_props.get("data_page_size_limit");
-            let dictionary_page_size_limit = writer_props.get("dictionary_page_size_limit");
-            let data_page_row_count_limit = writer_props.get("data_page_row_count_limit");
-            let write_batch_size = writer_props.get("write_batch_size");
-            let max_row_group_size = writer_props.get("max_row_group_size");
-
-            if let Some(data_page_size) = data_page_size_limit {
-                properties = properties.set_data_page_size_limit(*data_page_size);
+            if let Some(src_alias) = source_alias {
+                cmd = cmd.with_source_alias(src_alias);
             }
-            if let Some(dictionary_page_size) = dictionary_page_size_limit {
-                properties = properties.set_dictionary_page_size_limit(*dictionary_page_size);
-            }
-            if let Some(data_page_row_count) = data_page_row_count_limit {
-                properties = properties.set_data_page_row_count_limit(*data_page_row_count);
-            }
-            if let Some(batch_size) = write_batch_size {
-                properties = properties.set_write_batch_size(*batch_size);
-            }
-            if let Some(row_group_size) = max_row_group_size {
-                properties = properties.set_max_row_group_size(*row_group_size);
-            }
-            cmd = cmd.with_writer_properties(properties.build());
-        }
 
-        if let Some(mu_updates) = matched_update_updates {
-            if let Some(mu_predicate) = matched_update_predicate {
-                for it in mu_updates.iter().zip(mu_predicate.iter()) {
-                    let (update_values, predicate_value) = it;
+            if let Some(trgt_alias) = target_alias {
+                cmd = cmd.with_target_alias(trgt_alias);
+            }
 
-                    if let Some(pred) = predicate_value {
-                        cmd = cmd
-                            .when_matched_update(|mut update| {
-                                for (col_name, expression) in update_values {
-                                    update = update.update(col_name.clone(), expression.clone());
-                                }
-                                update.predicate(pred.clone())
-                            })
-                            .map_err(PythonError::from)?;
-                    } else {
-                        cmd = cmd
-                            .when_matched_update(|mut update| {
-                                for (col_name, expression) in update_values {
-                                    update = update.update(col_name.clone(), expression.clone());
-                                }
-                                update
-                            })
-                            .map_err(PythonError::from)?;
+            if let Some(writer_props) = writer_properties {
+                cmd = cmd.with_writer_properties(
+                    set_writer_properties(writer_props).map_err(PythonError::from)?,
+                );
+            }
+
+            if let Some(metadata) = custom_metadata {
+                let json_metadata: Map<String, Value> =
+                    metadata.into_iter().map(|(k, v)| (k, v.into())).collect();
+                cmd = cmd.with_commit_properties(
+                    CommitProperties::default().with_metadata(json_metadata),
+                );
+            };
+
+            if let Some(mu_updates) = matched_update_updates {
+                if let Some(mu_predicate) = matched_update_predicate {
+                    for it in mu_updates.iter().zip(mu_predicate.iter()) {
+                        let (update_values, predicate_value) = it;
+
+                        if let Some(pred) = predicate_value {
+                            cmd = cmd
+                                .when_matched_update(|mut update| {
+                                    for (col_name, expression) in update_values {
+                                        update =
+                                            update.update(col_name.clone(), expression.clone());
+                                    }
+                                    update.predicate(pred.clone())
+                                })
+                                .map_err(PythonError::from)?;
+                        } else {
+                            cmd = cmd
+                                .when_matched_update(|mut update| {
+                                    for (col_name, expression) in update_values {
+                                        update =
+                                            update.update(col_name.clone(), expression.clone());
+                                    }
+                                    update
+                                })
+                                .map_err(PythonError::from)?;
+                        }
                     }
                 }
             }
-        }
 
-        if let Some(_md_delete_all) = matched_delete_all {
-            cmd = cmd
-                .when_matched_delete(|delete| delete)
-                .map_err(PythonError::from)?;
-        } else if let Some(md_predicate) = matched_delete_predicate {
-            for pred in md_predicate.iter() {
+            if let Some(_md_delete_all) = matched_delete_all {
                 cmd = cmd
-                    .when_matched_delete(|delete| delete.predicate(pred.clone()))
+                    .when_matched_delete(|delete| delete)
                     .map_err(PythonError::from)?;
+            } else if let Some(md_predicate) = matched_delete_predicate {
+                for pred in md_predicate.iter() {
+                    cmd = cmd
+                        .when_matched_delete(|delete| delete.predicate(pred.clone()))
+                        .map_err(PythonError::from)?;
+                }
             }
-        }
 
-        if let Some(nmi_updates) = not_matched_insert_updates {
-            if let Some(nmi_predicate) = not_matched_insert_predicate {
-                for it in nmi_updates.iter().zip(nmi_predicate.iter()) {
-                    let (update_values, predicate_value) = it;
-                    if let Some(pred) = predicate_value {
-                        cmd = cmd
-                            .when_not_matched_insert(|mut insert| {
-                                for (col_name, expression) in update_values {
-                                    insert = insert.set(col_name.clone(), expression.clone());
-                                }
-                                insert.predicate(pred.clone())
-                            })
-                            .map_err(PythonError::from)?;
-                    } else {
-                        cmd = cmd
-                            .when_not_matched_insert(|mut insert| {
-                                for (col_name, expression) in update_values {
-                                    insert = insert.set(col_name.clone(), expression.clone());
-                                }
-                                insert
-                            })
-                            .map_err(PythonError::from)?;
+            if let Some(nmi_updates) = not_matched_insert_updates {
+                if let Some(nmi_predicate) = not_matched_insert_predicate {
+                    for it in nmi_updates.iter().zip(nmi_predicate.iter()) {
+                        let (update_values, predicate_value) = it;
+                        if let Some(pred) = predicate_value {
+                            cmd = cmd
+                                .when_not_matched_insert(|mut insert| {
+                                    for (col_name, expression) in update_values {
+                                        insert = insert.set(col_name.clone(), expression.clone());
+                                    }
+                                    insert.predicate(pred.clone())
+                                })
+                                .map_err(PythonError::from)?;
+                        } else {
+                            cmd = cmd
+                                .when_not_matched_insert(|mut insert| {
+                                    for (col_name, expression) in update_values {
+                                        insert = insert.set(col_name.clone(), expression.clone());
+                                    }
+                                    insert
+                                })
+                                .map_err(PythonError::from)?;
+                        }
                     }
                 }
             }
-        }
 
-        if let Some(nmbsu_updates) = not_matched_by_source_update_updates {
-            if let Some(nmbsu_predicate) = not_matched_by_source_update_predicate {
-                for it in nmbsu_updates.iter().zip(nmbsu_predicate.iter()) {
-                    let (update_values, predicate_value) = it;
-                    if let Some(pred) = predicate_value {
-                        cmd = cmd
-                            .when_not_matched_by_source_update(|mut update| {
-                                for (col_name, expression) in update_values {
-                                    update = update.update(col_name.clone(), expression.clone());
-                                }
-                                update.predicate(pred.clone())
-                            })
-                            .map_err(PythonError::from)?;
-                    } else {
-                        cmd = cmd
-                            .when_not_matched_by_source_update(|mut update| {
-                                for (col_name, expression) in update_values {
-                                    update = update.update(col_name.clone(), expression.clone());
-                                }
-                                update
-                            })
-                            .map_err(PythonError::from)?;
+            if let Some(nmbsu_updates) = not_matched_by_source_update_updates {
+                if let Some(nmbsu_predicate) = not_matched_by_source_update_predicate {
+                    for it in nmbsu_updates.iter().zip(nmbsu_predicate.iter()) {
+                        let (update_values, predicate_value) = it;
+                        if let Some(pred) = predicate_value {
+                            cmd = cmd
+                                .when_not_matched_by_source_update(|mut update| {
+                                    for (col_name, expression) in update_values {
+                                        update =
+                                            update.update(col_name.clone(), expression.clone());
+                                    }
+                                    update.predicate(pred.clone())
+                                })
+                                .map_err(PythonError::from)?;
+                        } else {
+                            cmd = cmd
+                                .when_not_matched_by_source_update(|mut update| {
+                                    for (col_name, expression) in update_values {
+                                        update =
+                                            update.update(col_name.clone(), expression.clone());
+                                    }
+                                    update
+                                })
+                                .map_err(PythonError::from)?;
+                        }
                     }
                 }
             }
-        }
 
-        if let Some(_nmbs_delete_all) = not_matched_by_source_delete_all {
-            cmd = cmd
-                .when_not_matched_by_source_delete(|delete| delete)
-                .map_err(PythonError::from)?;
-        } else if let Some(nmbs_predicate) = not_matched_by_source_delete_predicate {
-            for pred in nmbs_predicate.iter() {
+            if let Some(_nmbs_delete_all) = not_matched_by_source_delete_all {
                 cmd = cmd
-                    .when_not_matched_by_source_delete(|delete| delete.predicate(pred.clone()))
+                    .when_not_matched_by_source_delete(|delete| delete)
                     .map_err(PythonError::from)?;
+            } else if let Some(nmbs_predicate) = not_matched_by_source_delete_predicate {
+                for pred in nmbs_predicate.iter() {
+                    cmd = cmd
+                        .when_not_matched_by_source_delete(|delete| delete.predicate(pred.clone()))
+                        .map_err(PythonError::from)?;
+                }
             }
-        }
 
-        let (table, metrics) = rt()?
-            .block_on(cmd.into_future())
-            .map_err(PythonError::from)?;
-        self._table.state = table.state;
-        Ok(serde_json::to_string(&metrics).unwrap())
+            let (table, metrics) = rt()?
+                .block_on(cmd.into_future())
+                .map_err(PythonError::from)?;
+            self._table.state = table.state;
+            Ok(serde_json::to_string(&metrics).unwrap())
+        })
     }
 
     // Run the restore command on the Delta Table: restore table to a given version or datetime
-    #[pyo3(signature = (target, *, ignore_missing_files = false, protocol_downgrade_allowed = false))]
+    #[pyo3(signature = (target, *, ignore_missing_files = false, protocol_downgrade_allowed = false, custom_metadata=None))]
     pub fn restore(
         &mut self,
         target: Option<&PyAny>,
         ignore_missing_files: bool,
         protocol_downgrade_allowed: bool,
+        custom_metadata: Option<HashMap<String, String>>,
     ) -> PyResult<String> {
-        let mut cmd = RestoreBuilder::new(self._table.log_store(), self._table.state.clone());
+        let mut cmd = RestoreBuilder::new(
+            self._table.log_store(),
+            self._table.snapshot().map_err(PythonError::from)?.clone(),
+        );
         if let Some(val) = target {
             if let Ok(version) = val.extract::<i64>() {
                 cmd = cmd.with_version_to_restore(version)
@@ -601,6 +749,14 @@ impl RawDeltaTable {
         }
         cmd = cmd.with_ignore_missing_files(ignore_missing_files);
         cmd = cmd.with_protocol_downgrade_allowed(protocol_downgrade_allowed);
+
+        if let Some(metadata) = custom_metadata {
+            let json_metadata: Map<String, Value> =
+                metadata.into_iter().map(|(k, v)| (k, v.into())).collect();
+            cmd = cmd
+                .with_commit_properties(CommitProperties::default().with_metadata(json_metadata));
+        };
+
         let (table, metrics) = rt()?
             .block_on(cmd.into_future())
             .map_err(PythonError::from)?;
@@ -620,6 +776,7 @@ impl RawDeltaTable {
     }
 
     pub fn update_incremental(&mut self) -> PyResult<()> {
+        #[allow(deprecated)]
         Ok(rt()?
             .block_on(self._table.update_incremental(None))
             .map_err(PythonError::from)?)
@@ -637,19 +794,20 @@ impl RawDeltaTable {
             )),
             None => None,
         };
-
         self._table
-            .get_files_iter()
-            .map(|p| p.to_string())
-            .zip(self._table.get_partition_values())
-            .zip(self._table.get_stats())
-            .filter(|((path, _), _)| match &path_set {
-                Some(path_set) => path_set.contains(path),
-                None => true,
+            .snapshot()
+            .map_err(PythonError::from)?
+            .log_data()
+            .into_iter()
+            .filter_map(|f| {
+                let path = f.path().to_string();
+                match &path_set {
+                    Some(path_set) => path_set.contains(&path).then_some((path, f)),
+                    None => Some((path, f)),
+                }
             })
-            .map(|((path, partition_values), stats)| {
-                let stats = stats.map_err(PythonError::from)?;
-                let expression = filestats_to_expression(py, &schema, partition_values, stats)?;
+            .map(|(path, f)| {
+                let expression = filestats_to_expression_next(py, &schema, f)?;
                 Ok((path, expression))
             })
             .collect()
@@ -707,16 +865,31 @@ impl RawDeltaTable {
 
         let partition_columns: Vec<&str> = partition_columns.into_iter().collect();
 
-        let active_partitions: HashSet<Vec<(&str, Option<&str>)>> = self
+        let adds = self
             ._table
-            .get_state()
+            .snapshot()
+            .map_err(PythonError::from)?
             .get_active_add_actions_by_partitions(&converted_filters)
             .map_err(PythonError::from)?
-            .map(|add| {
-                partition_columns
-                    .iter()
-                    .map(|col| (*col, add.partition_values.get(*col).unwrap().as_deref()))
-                    .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PythonError::from)?;
+        let active_partitions: HashSet<Vec<(&str, Option<String>)>> = adds
+            .iter()
+            .flat_map(|add| {
+                Ok::<_, PythonError>(
+                    partition_columns
+                        .iter()
+                        .flat_map(|col| {
+                            Ok::<_, PythonError>((
+                                *col,
+                                add.partition_values()
+                                    .map_err(PythonError::from)?
+                                    .get(*col)
+                                    .map(|v| v.serialize()),
+                            ))
+                        })
+                        .collect(),
+                )
             })
             .collect();
 
@@ -734,6 +907,7 @@ impl RawDeltaTable {
         partition_by: Vec<String>,
         schema: PyArrowType<ArrowSchema>,
         partitions_filters: Option<Vec<(&str, &str, PartitionFilterValue)>>,
+        custom_metadata: Option<HashMap<String, String>>,
     ) -> PyResult<()> {
         let mode = mode.parse().map_err(PythonError::from)?;
 
@@ -754,22 +928,40 @@ impl RawDeltaTable {
 
                 let add_actions = self
                     ._table
-                    .get_state()
+                    .snapshot()
+                    .map_err(PythonError::from)?
                     .get_active_add_actions_by_partitions(&converted_filters)
                     .map_err(PythonError::from)?;
 
                 for old_add in add_actions {
+                    let old_add = old_add.map_err(PythonError::from)?;
                     let remove_action = Action::Remove(Remove {
-                        path: old_add.path.clone(),
+                        path: old_add.path().to_string(),
                         deletion_timestamp: Some(current_timestamp()),
                         data_change: true,
-                        extended_file_metadata: Some(old_add.tags.is_some()),
-                        partition_values: Some(old_add.partition_values.clone()),
-                        size: Some(old_add.size),
-                        deletion_vector: old_add.deletion_vector.clone(),
-                        tags: old_add.tags.clone(),
-                        base_row_id: old_add.base_row_id,
-                        default_row_commit_version: old_add.default_row_commit_version,
+                        extended_file_metadata: Some(true),
+                        partition_values: Some(
+                            old_add
+                                .partition_values()
+                                .map_err(PythonError::from)?
+                                .iter()
+                                .map(|(k, v)| {
+                                    (
+                                        k.to_string(),
+                                        if v.is_null() {
+                                            None
+                                        } else {
+                                            Some(v.serialize())
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        ),
+                        size: Some(old_add.size()),
+                        deletion_vector: None,
+                        tags: None,
+                        base_row_id: None,
+                        default_row_commit_version: None,
                     });
                     actions.push(remove_action);
                 }
@@ -796,16 +988,26 @@ impl RawDeltaTable {
             partition_by: Some(partition_by),
             predicate: None,
         };
-        let store = self._table.log_store();
 
         rt()?
-            .block_on(commit(
-                &*store,
-                &actions,
-                operation,
-                self._table.get_state(),
-                None,
-            ))
+            .block_on(
+                CommitBuilder::from(
+                    CommitProperties::default().with_metadata(
+                        custom_metadata
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|(k, v)| (k, v.into())),
+                    ),
+                )
+                .with_actions(actions)
+                .build(
+                    Some(self._table.snapshot().map_err(PythonError::from)?),
+                    self._table.log_store(),
+                    operation,
+                )
+                .map_err(|err| PythonError::from(DeltaTableError::from(err)))?
+                .into_future(),
+            )
             .map_err(PythonError::from)?;
 
         Ok(())
@@ -839,19 +1041,42 @@ impl RawDeltaTable {
     pub fn get_add_actions(&self, flatten: bool) -> PyResult<PyArrowType<RecordBatch>> {
         Ok(PyArrowType(
             self._table
-                .get_state()
+                .snapshot()
+                .map_err(PythonError::from)?
                 .add_actions_table(flatten)
                 .map_err(PythonError::from)?,
         ))
     }
 
     /// Run the delete command on the delta table: delete records following a predicate and return the delete metrics.
-    #[pyo3(signature = (predicate = None))]
-    pub fn delete(&mut self, predicate: Option<String>) -> PyResult<String> {
-        let mut cmd = DeleteBuilder::new(self._table.log_store(), self._table.state.clone());
+    #[pyo3(signature = (predicate = None, writer_properties=None, custom_metadata=None))]
+    pub fn delete(
+        &mut self,
+        predicate: Option<String>,
+        writer_properties: Option<HashMap<String, Option<String>>>,
+        custom_metadata: Option<HashMap<String, String>>,
+    ) -> PyResult<String> {
+        let mut cmd = DeleteBuilder::new(
+            self._table.log_store(),
+            self._table.snapshot().map_err(PythonError::from)?.clone(),
+        );
         if let Some(predicate) = predicate {
             cmd = cmd.with_predicate(predicate);
         }
+
+        if let Some(writer_props) = writer_properties {
+            cmd = cmd.with_writer_properties(
+                set_writer_properties(writer_props).map_err(PythonError::from)?,
+            );
+        }
+
+        if let Some(metadata) = custom_metadata {
+            let json_metadata: Map<String, Value> =
+                metadata.into_iter().map(|(k, v)| (k, v.into())).collect();
+            cmd = cmd
+                .with_commit_properties(CommitProperties::default().with_metadata(json_metadata));
+        };
+
         let (table, metrics) = rt()?
             .block_on(cmd.into_future())
             .map_err(PythonError::from)?;
@@ -861,10 +1086,24 @@ impl RawDeltaTable {
 
     /// Execute the File System Check command (FSCK) on the delta table: removes old reference to files that
     /// have been deleted or are malformed
-    #[pyo3(signature = (dry_run = true))]
-    pub fn repair(&mut self, dry_run: bool) -> PyResult<String> {
-        let cmd = FileSystemCheckBuilder::new(self._table.log_store(), self._table.state.clone())
-            .with_dry_run(dry_run);
+    #[pyo3(signature = (dry_run = true, custom_metadata = None))]
+    pub fn repair(
+        &mut self,
+        dry_run: bool,
+        custom_metadata: Option<HashMap<String, String>>,
+    ) -> PyResult<String> {
+        let mut cmd = FileSystemCheckBuilder::new(
+            self._table.log_store(),
+            self._table.snapshot().map_err(PythonError::from)?.clone(),
+        )
+        .with_dry_run(dry_run);
+
+        if let Some(metadata) = custom_metadata {
+            let json_metadata: Map<String, Value> =
+                metadata.into_iter().map(|(k, v)| (k, v.into())).collect();
+            cmd = cmd
+                .with_commit_properties(CommitProperties::default().with_metadata(json_metadata));
+        };
 
         let (table, metrics) = rt()?
             .block_on(cmd.into_future())
@@ -872,6 +1111,45 @@ impl RawDeltaTable {
         self._table.state = table.state;
         Ok(serde_json::to_string(&metrics).unwrap())
     }
+}
+
+fn set_writer_properties(
+    writer_properties: HashMap<String, Option<String>>,
+) -> DeltaResult<WriterProperties> {
+    let mut properties = WriterProperties::builder();
+    let data_page_size_limit = writer_properties.get("data_page_size_limit");
+    let dictionary_page_size_limit = writer_properties.get("dictionary_page_size_limit");
+    let data_page_row_count_limit = writer_properties.get("data_page_row_count_limit");
+    let write_batch_size = writer_properties.get("write_batch_size");
+    let max_row_group_size = writer_properties.get("max_row_group_size");
+    let compression = writer_properties.get("compression");
+
+    if let Some(Some(data_page_size)) = data_page_size_limit {
+        properties = properties.set_data_page_size_limit(data_page_size.parse::<usize>().unwrap());
+    }
+    if let Some(Some(dictionary_page_size)) = dictionary_page_size_limit {
+        properties = properties
+            .set_dictionary_page_size_limit(dictionary_page_size.parse::<usize>().unwrap());
+    }
+    if let Some(Some(data_page_row_count)) = data_page_row_count_limit {
+        properties =
+            properties.set_data_page_row_count_limit(data_page_row_count.parse::<usize>().unwrap());
+    }
+    if let Some(Some(batch_size)) = write_batch_size {
+        properties = properties.set_write_batch_size(batch_size.parse::<usize>().unwrap());
+    }
+    if let Some(Some(row_group_size)) = max_row_group_size {
+        properties = properties.set_max_row_group_size(row_group_size.parse::<usize>().unwrap());
+    }
+
+    if let Some(Some(compression)) = compression {
+        let compress: Compression = compression
+            .parse()
+            .map_err(|err: ParquetError| DeltaTableError::Generic(err.to_string()))?;
+
+        properties = properties.set_compression(compress);
+    }
+    Ok(properties.build())
 }
 
 fn convert_partition_filters<'a>(
@@ -888,22 +1166,47 @@ fn convert_partition_filters<'a>(
         .collect()
 }
 
-fn json_value_to_py(value: &serde_json::Value, py: Python) -> PyObject {
-    match value {
-        serde_json::Value::Null => py.None(),
-        serde_json::Value::Bool(val) => val.to_object(py),
-        serde_json::Value::Number(val) => {
-            if val.is_f64() {
-                val.as_f64().expect("not an f64").to_object(py)
-            } else if val.is_i64() {
-                val.as_i64().expect("not an i64").to_object(py)
-            } else {
-                val.as_u64().expect("not an u64").to_object(py)
-            }
+fn scalar_to_py(value: &Scalar, py_date: &PyAny, py: Python) -> PyResult<PyObject> {
+    use Scalar::*;
+
+    let val = match value {
+        Null(_) => py.None(),
+        Boolean(val) => val.to_object(py),
+        Binary(val) => val.to_object(py),
+        String(val) => val.to_object(py),
+        Byte(val) => val.to_object(py),
+        Short(val) => val.to_object(py),
+        Integer(val) => val.to_object(py),
+        Long(val) => val.to_object(py),
+        Float(val) => val.to_object(py),
+        Double(val) => val.to_object(py),
+        Timestamp(_) => {
+            // We need to manually append 'Z' add to end so that pyarrow can cast the
+            // the scalar value to pa.timestamp("us","UTC")
+            let value = value.serialize();
+            format!("{}Z", value).to_object(py)
         }
-        serde_json::Value::String(val) => val.to_object(py),
-        _ => py.None(),
-    }
+        TimestampNtz(_) => {
+            let value = value.serialize();
+            value.to_object(py)
+        }
+        // NOTE: PyArrow 13.0.0 lost the ability to cast from string to date32, so
+        // we have to implement that manually.
+        Date(_) => {
+            let date = py_date.call_method1("fromisoformat", (value.serialize(),))?;
+            date.to_object(py)
+        }
+        Decimal(_, _, _) => value.serialize().to_object(py),
+        Struct(values, fields) => {
+            let py_struct = PyDict::new(py);
+            for (field, value) in fields.iter().zip(values.iter()) {
+                py_struct.set_item(field.name(), scalar_to_py(value, py_date, py)?)?;
+            }
+            py_struct.to_object(py)
+        }
+    };
+
+    Ok(val)
 }
 
 /// Create expression that file statistics guarantee to be true.
@@ -918,15 +1221,15 @@ fn json_value_to_py(value: &serde_json::Value, py: Python) -> PyObject {
 ///
 /// Statistics are translated into inequalities. If there are null values, then
 /// they must be OR'd with is_null.
-fn filestats_to_expression<'py>(
+fn filestats_to_expression_next<'py>(
     py: Python<'py>,
     schema: &PyArrowType<ArrowSchema>,
-    partitions_values: &HashMap<String, Option<String>>,
-    stats: Option<Stats>,
+    file_info: LogicalFile<'_>,
 ) -> PyResult<Option<&'py PyAny>> {
     let ds = PyModule::import(py, "pyarrow.dataset")?;
-    let field = ds.getattr("field")?;
+    let py_field = ds.getattr("field")?;
     let pa = PyModule::import(py, "pyarrow")?;
+    let py_date = Python::import(py, "datetime")?.getattr("date")?;
     let mut expressions: Vec<PyResult<&PyAny>> = Vec::new();
 
     let cast_to_type = |column_name: &String, value: PyObject, schema: &ArrowSchema| {
@@ -937,97 +1240,96 @@ fn filestats_to_expression<'py>(
             })?
             .data_type()
             .clone();
-
-        let value = match column_type {
-            // Since PyArrow 13.0.0, casting string -> timestamp fails if it ends with "Z"
-            // and the target type is timezone naive.
-            DataType::Timestamp(_, _) if value.extract::<String>(py).is_ok() => {
-                value.call_method1(py, "rstrip", ("Z",))?
-            }
-            // PyArrow 13.0.0 lost the ability to cast from string to date32, so
-            // we have to implement that manually.
-            DataType::Date32 if value.extract::<String>(py).is_ok() => {
-                let date = Python::import(py, "datetime")?.getattr("date")?;
-                let date = date.call_method1("fromisoformat", (value,))?;
-                date.to_object(py)
-            }
-            _ => value,
-        };
-
         let column_type = PyArrowType(column_type).into_py(py);
         pa.call_method1("scalar", (value,))?
             .call_method1("cast", (column_type,))
     };
 
-    for (column, value) in partitions_values.iter() {
-        if let Some(value) = value {
-            // value is a string, but needs to be parsed into appropriate type
-            let converted_value = cast_to_type(column, value.into_py(py), &schema.0)?;
-            expressions.push(
-                field
-                    .call1((column,))?
-                    .call_method1("__eq__", (converted_value,)),
-            );
-        } else {
-            expressions.push(field.call1((column,))?.call_method0("is_null"));
+    if let Ok(partitions_values) = file_info.partition_values() {
+        for (column, value) in partitions_values.iter() {
+            let column = column.to_string();
+            if !value.is_null() {
+                // value is a string, but needs to be parsed into appropriate type
+                let converted_value =
+                    cast_to_type(&column, scalar_to_py(value, py_date, py)?, &schema.0)?;
+                expressions.push(
+                    py_field
+                        .call1((&column,))?
+                        .call_method1("__eq__", (converted_value,)),
+                );
+            } else {
+                expressions.push(py_field.call1((column,))?.call_method0("is_null"));
+            }
         }
     }
 
-    if let Some(stats) = stats {
-        let mut has_nulls_set: HashSet<String> = HashSet::new();
+    let mut has_nulls_set: HashSet<String> = HashSet::new();
 
-        for (col_name, null_count) in stats.null_count.iter().filter_map(|(k, v)| match v {
-            ColumnCountStat::Value(val) => Some((k, val)),
-            _ => None,
-        }) {
-            if *null_count == 0 {
-                expressions.push(field.call1((col_name,))?.call_method0("is_valid"));
-            } else if *null_count == stats.num_records {
-                expressions.push(field.call1((col_name,))?.call_method0("is_null"));
-            } else {
-                has_nulls_set.insert(col_name.clone());
+    // NOTE: null_counts should always return a struct scalar.
+    if let Some(Scalar::Struct(values, fields)) = file_info.null_counts() {
+        for (field, value) in fields.iter().zip(values.iter()) {
+            if let Scalar::Long(val) = value {
+                if *val == 0 {
+                    expressions.push(py_field.call1((field.name(),))?.call_method0("is_valid"));
+                } else if Some(*val as usize) == file_info.num_records() {
+                    expressions.push(py_field.call1((field.name(),))?.call_method0("is_null"));
+                } else {
+                    has_nulls_set.insert(field.name().to_string());
+                }
             }
         }
+    }
 
-        for (col_name, minimum) in stats.min_values.iter().filter_map(|(k, v)| match v {
-            ColumnValueStat::Value(val) => Some((k.clone(), json_value_to_py(val, py))),
-            // TODO(wjones127): Handle nested field statistics.
-            // Blocked on https://issues.apache.org/jira/browse/ARROW-11259
-            _ => None,
-        }) {
-            let maybe_minimum = cast_to_type(&col_name, minimum, &schema.0);
-            if let Ok(minimum) = maybe_minimum {
-                let field_expr = field.call1((&col_name,))?;
-                let expr = field_expr.call_method1("__ge__", (minimum,));
-                let expr = if has_nulls_set.contains(&col_name) {
-                    // col >= min_value OR col is null
-                    let is_null_expr = field_expr.call_method0("is_null");
-                    expr?.call_method1("__or__", (is_null_expr?,))
-                } else {
-                    // col >= min_value
-                    expr
-                };
-                expressions.push(expr);
+    // NOTE: min_values should always return a struct scalar.
+    if let Some(Scalar::Struct(values, fields)) = file_info.min_values() {
+        for (field, value) in fields.iter().zip(values.iter()) {
+            match value {
+                // TODO: Handle nested field statistics.
+                Scalar::Struct(_, _) => {}
+                _ => {
+                    let maybe_minimum =
+                        cast_to_type(field.name(), scalar_to_py(value, py_date, py)?, &schema.0);
+                    if let Ok(minimum) = maybe_minimum {
+                        let field_expr = py_field.call1((field.name(),))?;
+                        let expr = field_expr.call_method1("__ge__", (minimum,));
+                        let expr = if has_nulls_set.contains(field.name()) {
+                            // col >= min_value OR col is null
+                            let is_null_expr = field_expr.call_method0("is_null");
+                            expr?.call_method1("__or__", (is_null_expr?,))
+                        } else {
+                            // col >= min_value
+                            expr
+                        };
+                        expressions.push(expr);
+                    }
+                }
             }
         }
+    }
 
-        for (col_name, maximum) in stats.max_values.iter().filter_map(|(k, v)| match v {
-            ColumnValueStat::Value(val) => Some((k.clone(), json_value_to_py(val, py))),
-            _ => None,
-        }) {
-            let maybe_maximum = cast_to_type(&col_name, maximum, &schema.0);
-            if let Ok(maximum) = maybe_maximum {
-                let field_expr = field.call1((&col_name,))?;
-                let expr = field_expr.call_method1("__le__", (maximum,));
-                let expr = if has_nulls_set.contains(&col_name) {
-                    // col <= max_value OR col is null
-                    let is_null_expr = field_expr.call_method0("is_null");
-                    expr?.call_method1("__or__", (is_null_expr?,))
-                } else {
-                    // col <= max_value
-                    expr
-                };
-                expressions.push(expr);
+    // NOTE: max_values should always return a struct scalar.
+    if let Some(Scalar::Struct(values, fields)) = file_info.max_values() {
+        for (field, value) in fields.iter().zip(values.iter()) {
+            match value {
+                // TODO: Handle nested field statistics.
+                Scalar::Struct(_, _) => {}
+                _ => {
+                    let maybe_maximum =
+                        cast_to_type(field.name(), scalar_to_py(value, py_date, py)?, &schema.0);
+                    if let Ok(maximum) = maybe_maximum {
+                        let field_expr = py_field.call1((field.name(),))?;
+                        let expr = field_expr.call_method1("__le__", (maximum,));
+                        let expr = if has_nulls_set.contains(field.name()) {
+                            // col <= max_value OR col is null
+                            let is_null_expr = field_expr.call_method0("is_null");
+                            expr?.call_method1("__or__", (is_null_expr?,))
+                        } else {
+                            // col <= max_value
+                            expr
+                        };
+                        expressions.push(expr);
+                    }
+                }
             }
         }
     }
@@ -1086,7 +1388,6 @@ impl From<&PyAddAction> for Add {
             path: action.path.clone(),
             size: action.size,
             partition_values: action.partition_values.clone(),
-            partition_values_parsed: None,
             modification_time: action.modification_time,
             data_change: action.data_change,
             stats: action.stats.clone(),
@@ -1103,59 +1404,78 @@ impl From<&PyAddAction> for Add {
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn write_to_deltalake(
+    py: Python,
     table_uri: String,
     data: PyArrowType<ArrowArrayStreamReader>,
     mode: String,
     max_rows_per_group: i64,
-    overwrite_schema: bool,
+    schema_mode: Option<String>,
     partition_by: Option<Vec<String>>,
     predicate: Option<String>,
     name: Option<String>,
     description: Option<String>,
     configuration: Option<HashMap<String, Option<String>>>,
     storage_options: Option<HashMap<String, String>>,
+    writer_properties: Option<HashMap<String, Option<String>>>,
+    custom_metadata: Option<HashMap<String, String>>,
 ) -> PyResult<()> {
-    let batches = data.0.map(|batch| batch.unwrap()).collect::<Vec<_>>();
-    let save_mode = mode.parse().map_err(PythonError::from)?;
+    py.allow_threads(|| {
+        let batches = data.0.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+        let save_mode = mode.parse().map_err(PythonError::from)?;
 
-    let options = storage_options.clone().unwrap_or_default();
-    let table = rt()?
-        .block_on(DeltaOps::try_from_uri_with_storage_options(
-            &table_uri, options,
-        ))
-        .map_err(PythonError::from)?;
+        let options = storage_options.clone().unwrap_or_default();
+        let table = rt()?
+            .block_on(DeltaOps::try_from_uri_with_storage_options(
+                &table_uri, options,
+            ))
+            .map_err(PythonError::from)?;
 
-    let mut builder = table
-        .write(batches)
-        .with_save_mode(save_mode)
-        .with_overwrite_schema(overwrite_schema)
-        .with_write_batch_size(max_rows_per_group as usize);
+        let mut builder = table
+            .write(batches)
+            .with_save_mode(save_mode)
+            .with_write_batch_size(max_rows_per_group as usize);
+        if let Some(schema_mode) = schema_mode {
+            builder = builder.with_schema_mode(schema_mode.parse().map_err(PythonError::from)?);
+        }
+        if let Some(partition_columns) = partition_by {
+            builder = builder.with_partition_columns(partition_columns);
+        }
 
-    if let Some(partition_columns) = partition_by {
-        builder = builder.with_partition_columns(partition_columns);
-    }
+        if let Some(writer_props) = writer_properties {
+            builder = builder.with_writer_properties(
+                set_writer_properties(writer_props).map_err(PythonError::from)?,
+            );
+        }
 
-    if let Some(name) = &name {
-        builder = builder.with_table_name(name);
-    };
+        if let Some(name) = &name {
+            builder = builder.with_table_name(name);
+        };
 
-    if let Some(description) = &description {
-        builder = builder.with_description(description);
-    };
+        if let Some(description) = &description {
+            builder = builder.with_description(description);
+        };
 
-    if let Some(predicate) = &predicate {
-        builder = builder.with_replace_where(predicate);
-    };
+        if let Some(predicate) = predicate {
+            builder = builder.with_replace_where(predicate);
+        };
 
-    if let Some(config) = configuration {
-        builder = builder.with_configuration(config);
-    };
+        if let Some(config) = configuration {
+            builder = builder.with_configuration(config);
+        };
 
-    rt()?
-        .block_on(builder.into_future())
-        .map_err(PythonError::from)?;
+        if let Some(metadata) = custom_metadata {
+            let json_metadata: Map<String, Value> =
+                metadata.into_iter().map(|(k, v)| (k, v.into())).collect();
+            builder = builder
+                .with_commit_properties(CommitProperties::default().with_metadata(json_metadata));
+        };
 
-    Ok(())
+        rt()?
+            .block_on(builder.into_future())
+            .map_err(PythonError::from)?;
+
+        Ok(())
+    })
 }
 
 #[pyfunction]
@@ -1169,6 +1489,7 @@ fn create_deltalake(
     description: Option<String>,
     configuration: Option<HashMap<String, Option<String>>>,
     storage_options: Option<HashMap<String, String>>,
+    custom_metadata: Option<HashMap<String, String>>,
 ) -> PyResult<()> {
     let table = DeltaTableBuilder::from_uri(table_uri)
         .with_storage_options(storage_options.unwrap_or_default())
@@ -1196,6 +1517,12 @@ fn create_deltalake(
         builder = builder.with_configuration(config);
     };
 
+    if let Some(metadata) = custom_metadata {
+        let json_metadata: Map<String, Value> =
+            metadata.into_iter().map(|(k, v)| (k, v.into())).collect();
+        builder = builder.with_metadata(json_metadata);
+    };
+
     rt()?
         .block_on(builder.into_future())
         .map_err(PythonError::from)?;
@@ -1215,6 +1542,7 @@ fn write_new_deltalake(
     description: Option<String>,
     configuration: Option<HashMap<String, Option<String>>>,
     storage_options: Option<HashMap<String, String>>,
+    custom_metadata: Option<HashMap<String, String>>,
 ) -> PyResult<()> {
     let table = DeltaTableBuilder::from_uri(table_uri)
         .with_storage_options(storage_options.unwrap_or_default())
@@ -1239,6 +1567,12 @@ fn write_new_deltalake(
 
     if let Some(config) = configuration {
         builder = builder.with_configuration(config);
+    };
+
+    if let Some(metadata) = custom_metadata {
+        let json_metadata: Map<String, Value> =
+            metadata.into_iter().map(|(k, v)| (k, v.into())).collect();
+        builder = builder.with_metadata(json_metadata);
     };
 
     rt()?
@@ -1319,7 +1653,7 @@ impl PyDeltaDataChecker {
             })
             .collect();
         Self {
-            inner: DeltaDataChecker::new(invariants),
+            inner: DeltaDataChecker::new_with_invariants(invariants),
             rt: tokio::runtime::Runtime::new().unwrap(),
         }
     }
@@ -1335,11 +1669,18 @@ impl PyDeltaDataChecker {
 #[pymodule]
 // module name need to match project name
 fn _internal(py: Python, m: &PyModule) -> PyResult<()> {
-    use crate::error::{CommitFailedError, DeltaError, TableNotFoundError};
+    use crate::error::{CommitFailedError, DeltaError, SchemaMismatchError, TableNotFoundError};
+
+    deltalake::aws::register_handlers(None);
+    deltalake::azure::register_handlers(None);
+    deltalake::gcp::register_handlers(None);
+    deltalake::mount::register_handlers(None);
+
     m.add("DeltaError", py.get_type::<DeltaError>())?;
     m.add("CommitFailedError", py.get_type::<CommitFailedError>())?;
     m.add("DeltaProtocolError", py.get_type::<DeltaProtocolError>())?;
     m.add("TableNotFoundError", py.get_type::<TableNotFoundError>())?;
+    m.add("SchemaMismatchError", py.get_type::<SchemaMismatchError>())?;
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
